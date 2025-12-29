@@ -1,5 +1,5 @@
 # AI Health Coach
-<img src=""/>
+<img src="https://github.com/buildr-daemon/ai-health-coach/blob/master/assets/health_agent.png" width="100%"/>
 # How to run it locally
 run ollama locally with 
 
