@@ -1,6 +1,6 @@
 """
 Chat API endpoints for the Health Agent.
-Handles initialization, messaging, history pagination, and typing indicators.
+Handles initialization, messaging, history pagination, and onboarding.
 """
 from fastapi import (
     APIRouter,
@@ -12,7 +12,7 @@ from fastapi import (
 )
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional
 import logging
 
@@ -34,12 +34,11 @@ from lib.schema import (
     SendMessageResponse,
     ChatHistoryPaginationRequest,
     ChatHistoryPaginationResponse,
-    TypingIndicatorRequest,
-    TypingIndicatorResponse,
+    OnboardingSubmissionRequest,
+    OnboardingSubmissionResponse,
     ErrorResponse,
     OnboardingStatus as OnboardingStatusEnum,
     MessageRole as MessageRoleEnum,
-    TypingStatus
 )
 from db.database import get_db
 from lib.agent import run_health_agent
@@ -53,7 +52,7 @@ router = APIRouter(prefix="/chat", tags=["Chat"])
 # === Constants ===
 INITIAL_HISTORY_LIMIT = 20  # Messages to load on init
 MAX_MESSAGE_LENGTH = 4000  # Character limit for messages
-TYPING_INDICATOR_TTL_SECONDS = 5  # How long typing indicator is valid
+MAX_CONTEXT_MESSAGES = 4  # Last 4 messages for agent context
 
 
 # === Error Helpers ===
@@ -171,7 +170,7 @@ def initialize_chat_session(
     recent_messages = db.query(Message).filter(
         Message.user_id == user.id
     ).order_by(
-        Message.id.desc()  # Get newest first
+        Message.id.desc()
     ).limit(INITIAL_HISTORY_LIMIT).all()
     
     # Reverse to chronological order (oldest first) for display
@@ -211,6 +210,42 @@ def initialize_chat_session(
     )
 
 
+@router.post(
+    "/onboarding",
+    response_model=OnboardingSubmissionResponse,
+    summary="Complete user onboarding",
+    description="""
+    Submit user profile information during onboarding.
+    Collects display name, age, and biological sex.
+    """
+)
+def complete_onboarding(
+    request: OnboardingSubmissionRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Complete user onboarding by saving profile information.
+    """
+    user = validate_user_exists(db, request.user_id)
+    
+    # Update user profile
+    user.display_name = request.display_name
+    user.age_years = request.age_years
+    user.biological_sex = request.biological_sex
+    user.onboarding_status = OnboardingStatus.COMPLETED
+    
+    db.commit()
+    db.refresh(user)
+    
+    logger.info(f"Completed onboarding for user {user.id}: {user.display_name}")
+    
+    return OnboardingSubmissionResponse(
+        success=True,
+        user_id=user.id,
+        message=f"Welcome {user.display_name}! Your profile has been saved."
+    )
+
+
 @router.get(
     "/history",
     response_model=ChatHistoryPaginationResponse,
@@ -237,11 +272,6 @@ def get_chat_history_paginated(
 ):
     """
     Paginated history for scroll-to-load-more functionality.
-    
-    Frontend should:
-    1. Call without cursor_message_id to get initial/recent messages
-    2. When scrolling up, call with cursor_message_id = oldest loaded message ID
-    3. Continue until has_more_messages is False
     """
     # Validate user exists
     user = validate_user_exists(db, user_id)
@@ -256,12 +286,12 @@ def get_chat_history_paginated(
     # Get messages (newest first, then reverse for display)
     messages = query.order_by(
         Message.id.desc()
-    ).limit(page_size + 1).all()  # +1 to check if more exist
+    ).limit(page_size + 1).all()
     
     # Check if there are more messages
     has_more = len(messages) > page_size
     if has_more:
-        messages = messages[:page_size]  # Remove the extra one
+        messages = messages[:page_size]
     
     # Reverse for chronological order
     messages = list(reversed(messages))
@@ -288,7 +318,7 @@ def get_chat_history_paginated(
     summary="Send a message and get AI response",
     description="""
     Send a user message and receive AI response.
-    The agent uses RAG for medical protocols and long-term user memory.
+    The agent uses RAG for medical protocols, rolling summary, and last 4 messages for context.
     """
 )
 async def send_chat_message(
@@ -300,13 +330,24 @@ async def send_chat_message(
     Main chat endpoint:
     1. Validates input
     2. Saves user message
-    3. Fetches context (history, memories, protocols)
-    4. Runs AI agent
+    3. Fetches last 4 messages for agent context
+    4. Runs AI agent (uses rolling summary internally)
     5. Saves AI response
     6. Returns both messages
     """
     # Validate user exists
     user = validate_user_exists(db, request.user_id)
+    
+    # Check onboarding status
+    if user.onboarding_status != OnboardingStatus.COMPLETED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error_code": "ONBOARDING_REQUIRED",
+                "error_message": "Please complete onboarding before chatting",
+                "details": {"onboarding_status": user.onboarding_status.value}
+            }
+        )
     
     # Additional validation
     if len(request.message_content) > MAX_MESSAGE_LENGTH:
@@ -320,7 +361,8 @@ async def send_chat_message(
         user_id=request.user_id,
         role=MessageRole.USER,
         content=request.message_content,
-        created_at=datetime.utcnow()
+        created_at=datetime.utcnow(),
+        is_summarized=False
     )
     db.add(user_message)
     db.commit()
@@ -328,13 +370,15 @@ async def send_chat_message(
     
     logger.info(f"Saved user message {user_message.id} for user {request.user_id}")
     
-    # 2. Fetch recent conversation history for context
-    # We load slightly more than needed for agent context
+    # 2. Fetch last 4 messages for agent context (rolling summary handles the rest)
     history_messages = db.query(Message).filter(
         Message.user_id == request.user_id
     ).order_by(
-        Message.id.asc()
-    ).limit(30).all()  # Recent history for context
+        Message.id.desc()
+    ).limit(MAX_CONTEXT_MESSAGES).all()
+    
+    # Reverse to chronological order
+    history_messages = list(reversed(history_messages))
     
     # Format messages for agent
     agent_messages = [
@@ -354,7 +398,6 @@ async def send_chat_message(
         
     except Exception as e:
         logger.error(f"Agent error for user {request.user_id}: {e}")
-        # Graceful fallback
         ai_response_content = (
             "I'm having a little trouble processing that right now. "
             "Could you try rephrasing or let me know how I can help? 🙏"
@@ -366,7 +409,8 @@ async def send_chat_message(
         user_id=request.user_id,
         role=MessageRole.ASSISTANT,
         content=ai_response_content,
-        created_at=datetime.utcnow()
+        created_at=datetime.utcnow(),
+        is_summarized=False
     )
     db.add(ai_message)
     db.commit()
@@ -386,209 +430,3 @@ async def send_chat_message(
         assistant_reply=message_to_response(ai_message),
         extracted_health_insights=extracted_insights
     )
-
-
-@router.post(
-    "/typing",
-    response_model=TypingIndicatorResponse,
-    summary="Update typing indicator status",
-    description="""
-    Update user's typing status for real-time chat experience.
-    Frontend should call this when user starts/stops typing.
-    Status is considered stale after 5 seconds.
-    """
-)
-def update_typing_indicator(
-    request: TypingIndicatorRequest,
-    db: Session = Depends(get_db)
-):
-    """
-    Update typing indicator for real-time UX.
-    
-    Frontend should:
-    - Send 'started' when user begins typing
-    - Send 'stopped' when user stops or sends message
-    - Polling endpoint can check if assistant is "typing"
-    """
-    # Validate user exists
-    validate_user_exists(db, request.user_id)
-    
-    is_typing = request.typing_status == TypingStatus.STARTED
-    
-    # Upsert typing indicator
-    indicator = db.query(TypingIndicator).filter(
-        TypingIndicator.user_id == request.user_id
-    ).first()
-    
-    if indicator:
-        indicator.is_typing = is_typing
-        indicator.last_updated_at = datetime.utcnow()
-    else:
-        indicator = TypingIndicator(
-            user_id=request.user_id,
-            is_typing=is_typing,
-            last_updated_at=datetime.utcnow()
-        )
-        db.add(indicator)
-    
-    db.commit()
-    
-    return TypingIndicatorResponse(
-        acknowledged=True,
-        timestamp=datetime.utcnow()
-    )
-
-
-@router.get(
-    "/typing/{user_id}",
-    response_model=TypingIndicatorResponse,
-    summary="Check typing indicator status",
-    description="Check if the AI is currently 'typing' a response for a user."
-)
-def get_typing_indicator(
-    user_id: int,
-    db: Session = Depends(get_db)
-):
-    """
-    Check current typing status.
-    Returns False if indicator is stale (>5 seconds old).
-    """
-    validate_user_exists(db, user_id)
-    
-    indicator = db.query(TypingIndicator).filter(
-        TypingIndicator.user_id == user_id
-    ).first()
-    
-    if not indicator:
-        return TypingIndicatorResponse(
-            acknowledged=False,
-            timestamp=datetime.utcnow()
-        )
-    
-    # Check if stale
-    is_stale = (
-        datetime.utcnow() - indicator.last_updated_at
-    ).total_seconds() > TYPING_INDICATOR_TTL_SECONDS
-    
-    return TypingIndicatorResponse(
-        acknowledged=indicator.is_typing and not is_stale,
-        timestamp=indicator.last_updated_at
-    )
-
-
-@router.delete(
-    "/history/{user_id}",
-    summary="Clear chat history",
-    description="Clear all chat history for a user. Use with caution."
-)
-def clear_chat_history(
-    user_id: int,
-    confirm: bool = Query(
-        False, 
-        description="Must be true to confirm deletion"
-    ),
-    db: Session = Depends(get_db)
-):
-    """
-    Clear all messages for a user.
-    Requires confirm=true as safety check.
-    """
-    if not confirm:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "error_code": "CONFIRMATION_REQUIRED",
-                "error_message": "Set confirm=true to delete history"
-            }
-        )
-    
-    user = validate_user_exists(db, user_id)
-    
-    # Delete messages
-    deleted_count = db.query(Message).filter(
-        Message.user_id == user_id
-    ).delete()
-    
-    # Also clear summaries
-    db.query(ConversationSummary).filter(
-        ConversationSummary.user_id == user_id
-    ).delete()
-    
-    db.commit()
-    
-    logger.info(f"Cleared {deleted_count} messages for user {user_id}")
-    
-    return {
-        "success": True,
-        "deleted_message_count": deleted_count,
-        "user_id": user_id
-    }
-
-
-@router.get(
-    "/user/{user_id}/profile",
-    summary="Get user profile and memory",
-    description="Get user's profile information and extracted health memories."
-)
-def get_user_profile(
-    user_id: int,
-    db: Session = Depends(get_db)
-):
-    """
-    Get user profile including extracted health facts.
-    Useful for debugging and user transparency.
-    """
-    user = validate_user_exists(db, user_id)
-    
-    # Get user's memories
-    memories = db.query(UserMemoryFact).filter(
-        UserMemoryFact.user_id == user_id,
-        UserMemoryFact.is_active == True
-    ).order_by(
-        UserMemoryFact.created_at.desc()
-    ).limit(50).all()
-    
-    return {
-        "user_id": user.id,
-        "display_name": user.display_name,
-        "onboarding_status": user.onboarding_status.value,
-        "health_profile_summary": user.health_profile_summary,
-        "created_at": user.created_at,
-        "last_active_at": user.last_active_at,
-        "memory_facts": [
-            {
-                "id": m.id,
-                "fact": m.fact_content,
-                "category": m.category.value if m.category else None,
-                "extracted_at": m.created_at
-            }
-            for m in memories
-        ]
-    }
-
-
-# === Health Check ===
-
-@router.get(
-    "/health",
-    summary="Health check endpoint",
-    description="Check if the chat service is healthy."
-)
-def health_check(db: Session = Depends(get_db)):
-    """Simple health check that verifies DB connection."""
-    try:
-        # Quick DB query to verify connection
-        db.execute("SELECT 1")
-        return {
-            "status": "healthy",
-            "timestamp": datetime.utcnow(),
-            "service": "chat-api"
-        }
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={
-                "status": "unhealthy",
-                "error": str(e)
-            }
-        )

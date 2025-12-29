@@ -1,10 +1,9 @@
 """
 LangGraph-based Health Agent with RAG, memory extraction, and context management.
-Handles onboarding, long-term memory, and medical protocol retrieval.
+Handles long-term memory and medical protocol retrieval.
 """
 from typing import List, TypedDict, Annotated, Optional, Any
 import operator
-import re
 import json
 import logging
 import os
@@ -12,7 +11,6 @@ import os
 from langchain_ollama import ChatOllama
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langgraph.graph import StateGraph, END
-from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv, find_dotenv
 
@@ -24,40 +22,37 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Model configuration
-LLM_MODEL_NAME = os.getenv("OLLAMA_MODEL_NAME", "llama3.2")  # Local Ollama model
+LLM_MODEL_NAME = os.getenv("OLLAMA_MODEL_NAME", "llama3.2")
 LLM_TEMPERATURE_FACTUAL = 0.1  # For RAG/extraction - need accuracy
 LLM_TEMPERATURE_CONVERSATIONAL = 0.4  # For responses - need warmth
-MAX_CONTEXT_MESSAGES = 4  # Messages to keep in active context
-SUMMARIZE_THRESHOLD = 5  # When to trigger summarization
+MAX_CONTEXT_MESSAGES = 4  # Messages to keep in active context (last 4)
+SUMMARIZE_EVERY_N_MESSAGES = 4  # Summarize every 4 new messages
 
 
 # === State Definition ===
 
 class AgentState(TypedDict):
     """
-    Complete state for the health agent graph.
-    Tracks all context needed for response generation.
+    Simplified state for the health agent graph.
+    Uses rolling summary + last 4 messages approach.
     """
     # User identification
     user_id: int
     user_display_name: Optional[str]
+    user_age: Optional[int]
+    user_biological_sex: Optional[str]
     
     # Conversation messages (append-only through operator.add)
     messages: Annotated[List[dict], operator.add]
     
     # Long-term context
-    user_health_profile_summary: Optional[str]
     user_memory_facts: List[dict]  # List of {fact_content, category}
     
     # RAG context
     retrieved_protocols: List[dict]  # List of {title, content, severity}
     
-    # Conversation management
-    conversation_summary: Optional[str]  # Summary of old messages
-    
-    # Onboarding state
-    is_onboarding_conversation: bool
-    onboarding_questions_asked: int
+    # Rolling summary (replaces old messages beyond last 4)
+    rolling_summary: Optional[str]
     
     # Output
     final_response: str
@@ -66,17 +61,11 @@ class AgentState(TypedDict):
 
 # === Helper Functions ===
 
-def estimate_token_count(text: str) -> int:
-    """Rough token estimation (4 chars per token average)."""
-    return len(text) // 4
-
-
 def extract_keywords_from_message(message_content: str) -> List[str]:
     """
     Extract potential medical keywords from a message for RAG matching.
     Uses simple pattern matching - could be enhanced with NER.
     """
-    # Common symptom keywords to look for
     symptom_keywords = [
         "fever", "temperature", "hot", "cold", "chill",
         "headache", "head", "migraine", "pain",
@@ -134,7 +123,6 @@ def match_protocols_by_keywords(
                 "matched_keywords": list(matches)
             })
     
-    # Sort by relevance score descending
     scored_protocols.sort(key=lambda x: x["relevance_score"], reverse=True)
     return scored_protocols[:max_results]
 
@@ -154,7 +142,6 @@ def retrieve_protocols_from_db(
     if not keywords:
         return []
     
-    # Get all active protocols
     protocols = db_session.query(MedicalProtocol).filter(
         MedicalProtocol.is_active == True
     ).all()
@@ -190,12 +177,12 @@ def retrieve_user_memories_from_db(
     ]
 
 
-def get_conversation_summary_from_db(
+def get_rolling_summary_from_db(
     db_session: Session, 
     user_id: int
 ) -> Optional[str]:
     """
-    Get the most recent conversation summary for context overflow handling.
+    Get the current rolling conversation summary.
     """
     from db.models import ConversationSummary
     
@@ -245,33 +232,88 @@ def save_extracted_facts_to_db(
     return saved_count
 
 
-def save_conversation_summary_to_db(
+def save_rolling_summary_to_db(
     db_session: Session,
     user_id: int,
     summary_content: str,
-    from_message_id: int,
-    to_message_id: int,
     message_count: int
 ):
-    """Save a conversation summary for context overflow handling."""
+    """Save/update the rolling conversation summary."""
     from db.models import ConversationSummary
+    
+    # Delete old summaries and create new one (rolling replacement)
+    db_session.query(ConversationSummary).filter(
+        ConversationSummary.user_id == user_id
+    ).delete()
     
     summary = ConversationSummary(
         user_id=user_id,
         summary_content=summary_content,
-        covers_messages_from_id=from_message_id,
-        covers_messages_to_id=to_message_id,
+        covers_messages_from_id=0,
+        covers_messages_to_id=0,
         message_count_summarized=message_count
     )
     db_session.add(summary)
     db_session.commit()
 
 
+def get_user_profile(db_session: Session, user_id: int) -> dict:
+    """Get user profile information."""
+    from db.models import User
+    
+    user = db_session.query(User).filter(User.id == user_id).first()
+    if not user:
+        return {}
+    
+    return {
+        "display_name": user.display_name,
+        "age": user.age_years,
+        "biological_sex": user.biological_sex
+    }
+
+
+def count_unsummarized_messages(db_session: Session, user_id: int) -> int:
+    """Count messages that haven't been summarized yet."""
+    from db.models import Message
+    
+    return db_session.query(Message).filter(
+        Message.user_id == user_id,
+        Message.is_summarized == False
+    ).count()
+
+
+def mark_messages_as_summarized(db_session: Session, user_id: int, message_ids: List[int]):
+    """Mark messages as summarized."""
+    from db.models import Message
+    
+    db_session.query(Message).filter(
+        Message.user_id == user_id,
+        Message.id.in_(message_ids)
+    ).update({Message.is_summarized: True}, synchronize_session=False)
+    db_session.commit()
+
+
 # === Graph Nodes ===
+
+def node_load_user_profile(state: AgentState, db_session: Session) -> dict:
+    """
+    Load user profile information.
+    """
+    logger.info(f"[Profile] Loading profile for user {state['user_id']}")
+    
+    profile = get_user_profile(db_session, state["user_id"])
+    
+    return {
+        "user_display_name": profile.get("display_name"),
+        "user_age": profile.get("age"),
+        "user_biological_sex": profile.get("biological_sex")
+    }
+
 
 def node_retrieve_context(state: AgentState, db_session: Session) -> dict:
     """
     RAG Node: Retrieves relevant medical protocols and user memories.
+    Also loads the rolling summary.
     """
     logger.info(f"[RAG] Retrieving context for user {state['user_id']}")
     
@@ -291,92 +333,90 @@ def node_retrieve_context(state: AgentState, db_session: Session) -> dict:
     memories = retrieve_user_memories_from_db(db_session, state["user_id"])
     logger.info(f"[RAG] Retrieved {len(memories)} user memories")
     
-    # Get existing conversation summary (for overflow handling)
-    summary = get_conversation_summary_from_db(db_session, state["user_id"])
+    # Get rolling summary
+    summary = get_rolling_summary_from_db(db_session, state["user_id"])
     
     return {
         "retrieved_protocols": protocols,
         "user_memory_facts": memories,
-        "conversation_summary": summary
-    }
-
-
-def node_check_onboarding(state: AgentState, db_session: Session) -> dict:
-    """
-    Check if this is an onboarding conversation and set appropriate flags.
-    """
-    from db.models import User, OnboardingStatus
-    
-    user = db_session.query(User).filter(User.id == state["user_id"]).first()
-    
-    if not user:
-        return {"is_onboarding_conversation": False}
-    
-    is_onboarding = user.onboarding_status != OnboardingStatus.COMPLETED
-    
-    return {
-        "is_onboarding_conversation": is_onboarding,
-        "user_display_name": user.display_name,
-        "user_health_profile_summary": user.health_profile_summary
+        "rolling_summary": summary
     }
 
 
 def node_summarize_if_needed(state: AgentState, db_session: Session) -> dict:
     """
-    Context Overflow Handler: Summarize old messages if context is too long.
+    Rolling Summary Handler: Summarize when we have 4+ unsummarized messages.
+    Creates/updates a rolling summary that incorporates old content.
     """
-    messages = state.get("messages", [])
+    from db.models import Message
     
-    if len(messages) < SUMMARIZE_THRESHOLD:
+    # Get unsummarized messages count
+    unsummarized_count = count_unsummarized_messages(db_session, state["user_id"])
+    
+    if unsummarized_count < SUMMARIZE_EVERY_N_MESSAGES:
+        logger.info(f"[Summarize] Skipping - only {unsummarized_count} unsummarized messages")
         return {}
     
-    logger.info(f"[Summarize] Triggering summarization, {len(messages)} messages in context")
+    logger.info(f"[Summarize] Triggering summarization, {unsummarized_count} unsummarized messages")
     
-    # Take oldest messages to summarize
-    messages_to_summarize = messages[:len(messages) - MAX_CONTEXT_MESSAGES]
+    # Get messages to summarize (all except last 4)
+    all_messages = db_session.query(Message).filter(
+        Message.user_id == state["user_id"],
+        Message.is_summarized == False
+    ).order_by(Message.id.asc()).all()
     
-    if not messages_to_summarize:
+    # Keep last 4, summarize the rest
+    if len(all_messages) <= MAX_CONTEXT_MESSAGES:
         return {}
+    
+    messages_to_summarize = all_messages[:-MAX_CONTEXT_MESSAGES]
     
     llm = ChatOllama(model=LLM_MODEL_NAME, temperature=LLM_TEMPERATURE_FACTUAL, base_url=OLLAMA_BASE_URL)
     
-    existing_summary = state.get("conversation_summary", "")
+    existing_summary = state.get("rolling_summary", "")
     
     # Format messages for summarization
     messages_text = "\n".join([
-        f"{m['role'].upper()}: {m['content']}" 
+        f"{m.role.value.upper()}: {m.content}" 
         for m in messages_to_summarize
     ])
     
-    prompt = f"""Summarize this health conversation concisely. 
-Focus on: symptoms mentioned, health concerns, lifestyle details, any advice given.
-Keep it under 200 words.
+    # Build prompt with proper handling of existing summary
+    summary_section = ""
+    if existing_summary:
+        summary_section = f"Previous summary to incorporate:\n{existing_summary}\n\n"
+    
+    prompt = f"""Create a concise rolling summary of this health conversation.
+Focus on: symptoms discussed, health concerns, lifestyle details, advice given, key decisions.
+Keep it under 150 words. This will be used as context for future responses.
 
-{'Previous summary: ' + existing_summary if existing_summary else ''}
-
-New messages to incorporate:
+{summary_section}New messages to summarize:
 {messages_text}
 
-Summary:"""
+Rolling Summary:
+"""
     
     try:
         response = llm.invoke(prompt)
         new_summary = response.content
         
-        # Save summary to database
-        if messages_to_summarize:
-            # This is simplified - in production, messages would have IDs
-            save_conversation_summary_to_db(
-                db_session,
-                state["user_id"],
-                new_summary,
-                from_message_id=0,
-                to_message_id=0,
-                message_count=len(messages_to_summarize)
-            )
+        # Save rolling summary (replaces old one)
+        save_rolling_summary_to_db(
+            db_session,
+            state["user_id"],
+            new_summary,
+            len(messages_to_summarize)
+        )
         
-        logger.info(f"[Summarize] Created summary of {len(messages_to_summarize)} messages")
-        return {"conversation_summary": new_summary}
+        # Mark messages as summarized
+        mark_messages_as_summarized(
+            db_session, 
+            state["user_id"], 
+            [m.id for m in messages_to_summarize]
+        )
+        
+        logger.info(f"[Summarize] Created rolling summary from {len(messages_to_summarize)} messages")
+        return {"rolling_summary": new_summary}
         
     except Exception as e:
         logger.error(f"[Summarize] Error during summarization: {e}")
@@ -386,7 +426,7 @@ Summary:"""
 def node_generate_response(state: AgentState) -> dict:
     """
     Main response generation node.
-    Uses all available context to generate a helpful, empathetic response.
+    Uses rolling summary + last 4 messages for context.
     """
     logger.info(f"[Generate] Generating response for user {state['user_id']}")
     
@@ -400,13 +440,10 @@ def node_generate_response(state: AgentState) -> dict:
     user_context = _build_user_context(state)
     protocol_context = _build_protocol_context(state)
     memory_context = _build_memory_context(state)
-    onboarding_instructions = _build_onboarding_instructions(state)
     
     # Build system prompt
     system_prompt = f"""You are a friendly AI Health Coach named "Healthie". 
 You chat like a real person on WhatsApp - warm, casual, helpful.
-
-{onboarding_instructions}
 
 === USER PROFILE ===
 {user_context}
@@ -417,8 +454,8 @@ You chat like a real person on WhatsApp - warm, casual, helpful.
 === RELEVANT MEDICAL GUIDELINES ===
 {protocol_context}
 
-=== CONVERSATION CONTEXT ===
-{state.get('conversation_summary', 'No prior summary.')}
+=== CONVERSATION CONTEXT (Summary of earlier conversation) ===
+{state.get('rolling_summary') or 'No prior conversation.'}
 
 === RESPONSE GUIDELINES ===
 1. Be conversational - short paragraphs, natural language
@@ -432,10 +469,10 @@ You chat like a real person on WhatsApp - warm, casual, helpful.
 9. Use emojis sparingly and naturally (1-2 max per message)
 10. Keep responses under 150 words for readability"""
 
-    # Build messages for LLM
+    # Build messages for LLM (only last 4 messages)
     llm_messages = [SystemMessage(content=system_prompt)]
     
-    # Add conversation messages (limited to recent)
+    # Add only the last 4 messages for context
     recent_messages = state.get("messages", [])[-MAX_CONTEXT_MESSAGES:]
     for msg in recent_messages:
         if msg["role"] == "user":
@@ -457,21 +494,20 @@ You chat like a real person on WhatsApp - warm, casual, helpful.
 def node_extract_facts(state: AgentState, db_session: Session) -> dict:
     """
     Extract health facts from the conversation for long-term memory.
-    Runs in the background to not block response.
+    Only runs every 3 user messages to reduce API calls.
     """
-    # Only extract if there's a meaningful conversation
     messages = state.get("messages", [])
     if len(messages) < 2:
         return {"extracted_facts": []}
     
-    # Rate limiting: Only extract facts every 3 messages to reduce API calls
+    # Rate limiting: Only extract facts every 3 user messages
     user_messages = [m for m in messages if m.get("role") == "user"]
     if len(user_messages) % 3 != 0:
         logger.info(f"[Extract] Skipping fact extraction (rate limiting: {len(user_messages)} user messages)")
         return {"extracted_facts": []}
     
     # Get last few messages for extraction
-    recent_messages = messages[-4:]  # Last 2 exchanges
+    recent_messages = messages[-4:]
     
     llm = ChatOllama(model=LLM_MODEL_NAME, temperature=LLM_TEMPERATURE_FACTUAL, base_url=OLLAMA_BASE_URL)
     
@@ -505,7 +541,6 @@ If no clear facts, respond with {{"facts": []}}"""
         
         # Parse JSON response
         response_text = response.content.strip()
-        # Handle markdown code blocks
         if "```json" in response_text:
             response_text = response_text.split("```json")[1].split("```")[0]
         elif "```" in response_text:
@@ -527,62 +562,11 @@ If no clear facts, respond with {{"facts": []}}"""
         
     except Exception as e:
         error_str = str(e)
-        # Check if it's a quota error
         if "RESOURCE_EXHAUSTED" in error_str or "quota" in error_str.lower():
             logger.warning(f"[Extract] Quota limit reached, skipping fact extraction")
         else:
             logger.error(f"[Extract] Error extracting facts: {e}")
         return {"extracted_facts": []}
-
-
-def node_update_onboarding_status(state: AgentState, db_session: Session) -> dict:
-    """
-    Update user's onboarding status based on conversation progress.
-    """
-    if not state.get("is_onboarding_conversation"):
-        return {}
-    
-    from db.models import User, OnboardingStatus
-    
-    # Check if we have enough information to complete onboarding
-    user = db_session.query(User).filter(User.id == state["user_id"]).first()
-    if not user:
-        return {}
-    
-    # Simple heuristic: after 3 exchanges, mark onboarding as in progress
-    # After user provides name, mark as complete
-    messages = state.get("messages", [])
-    user_messages = [m for m in messages if m.get("role") == "user"]
-    
-    if len(user_messages) >= 1 and user.onboarding_status == OnboardingStatus.NOT_STARTED:
-        user.onboarding_status = OnboardingStatus.IN_PROGRESS
-        db_session.commit()
-        logger.info(f"[Onboarding] User {user.id} status -> IN_PROGRESS")
-    
-    # Check if user mentioned their name
-    if user.display_name is None:
-        for msg in user_messages:
-            # Simple name extraction - could be enhanced with NER
-            content_lower = msg["content"].lower()
-            if any(phrase in content_lower for phrase in ["my name is", "i'm ", "i am ", "call me"]):
-                # Try to extract name - improved regex to avoid false positives
-                name_match = re.search(
-                    r"(?:my name is|i'm|i am|call me)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)", 
-                    msg["content"], 
-                    re.IGNORECASE
-                )
-                if name_match:
-                    extracted_name = name_match.group(1).strip().title()
-                    # Validate the name (at least 2 chars, not common false positives)
-                    invalid_names = ["having", "going", "feeling", "doing", "being", "coming"]
-                    if len(extracted_name) >= 2 and extracted_name.lower() not in invalid_names:
-                        user.display_name = extracted_name
-                        user.onboarding_status = OnboardingStatus.COMPLETED
-                        db_session.commit()
-                        logger.info(f"[Onboarding] Extracted name: {user.display_name}, status -> COMPLETED")
-                        break
-    
-    return {}
 
 
 # === Context Building Helpers ===
@@ -594,12 +578,15 @@ def _build_user_context(state: AgentState) -> str:
     if state.get("user_display_name"):
         parts.append(f"Name: {state['user_display_name']}")
     else:
-        parts.append("Name: Unknown (ask them!)")
+        parts.append("Name: Unknown")
     
-    if state.get("user_health_profile_summary"):
-        parts.append(f"Health Profile: {state['user_health_profile_summary']}")
+    if state.get("user_age"):
+        parts.append(f"Age: {state['user_age']} years")
     
-    return "\n".join(parts) if parts else "New user - no profile yet."
+    if state.get("user_biological_sex"):
+        parts.append(f"Biological Sex: {state['user_biological_sex']}")
+    
+    return "\n".join(parts) if parts else "No profile information available."
 
 
 def _build_protocol_context(state: AgentState) -> str:
@@ -647,40 +634,23 @@ def _build_memory_context(state: AgentState) -> str:
     return "\n".join(parts)
 
 
-def _build_onboarding_instructions(state: AgentState) -> str:
-    """Build onboarding-specific instructions."""
-    if not state.get("is_onboarding_conversation"):
-        return ""
-    
-    return """
-=== ONBOARDING MODE ===
-This is a new user! Your goals for this conversation:
-1. Welcome them warmly
-2. Ask for their name naturally
-3. Ask about any current health concerns
-4. Let them know you're here to help with health questions
-
-Be friendly and not overwhelming - just get to know them naturally through conversation.
-Don't ask all questions at once - let it flow like a real chat.
-"""
-
-
 # === Main Agent Factory ===
 
 def create_health_agent(db_session: Session):
     """
     Create a compiled health agent graph with database session injected.
+    Simplified flow without onboarding (handled separately via form).
     """
     workflow = StateGraph(AgentState)
     
     # Add nodes with db_session closure
     workflow.add_node(
-        "retrieve_context", 
-        lambda state: node_retrieve_context(state, db_session)
+        "load_profile",
+        lambda state: node_load_user_profile(state, db_session)
     )
     workflow.add_node(
-        "check_onboarding",
-        lambda state: node_check_onboarding(state, db_session)
+        "retrieve_context", 
+        lambda state: node_retrieve_context(state, db_session)
     )
     workflow.add_node(
         "summarize_if_needed",
@@ -688,25 +658,20 @@ def create_health_agent(db_session: Session):
     )
     workflow.add_node(
         "generate_response",
-        node_generate_response  # Doesn't need db
+        node_generate_response
     )
     workflow.add_node(
         "extract_facts",
         lambda state: node_extract_facts(state, db_session)
     )
-    workflow.add_node(
-        "update_onboarding",
-        lambda state: node_update_onboarding_status(state, db_session)
-    )
     
-    # Define flow
-    workflow.set_entry_point("check_onboarding")
-    workflow.add_edge("check_onboarding", "retrieve_context")
+    # Define flow (simplified - no onboarding)
+    workflow.set_entry_point("load_profile")
+    workflow.add_edge("load_profile", "retrieve_context")
     workflow.add_edge("retrieve_context", "summarize_if_needed")
     workflow.add_edge("summarize_if_needed", "generate_response")
     workflow.add_edge("generate_response", "extract_facts")
-    workflow.add_edge("extract_facts", "update_onboarding")
-    workflow.add_edge("update_onboarding", END)
+    workflow.add_edge("extract_facts", END)
     
     return workflow.compile()
 
@@ -729,17 +694,16 @@ def run_health_agent(
     """
     agent = create_health_agent(db_session)
     
-    # Prepare initial state
+    # Prepare initial state (simplified)
     initial_state = {
         "user_id": user_id,
         "user_display_name": None,
+        "user_age": None,
+        "user_biological_sex": None,
         "messages": messages,
-        "user_health_profile_summary": None,
         "user_memory_facts": [],
         "retrieved_protocols": [],
-        "conversation_summary": None,
-        "is_onboarding_conversation": False,
-        "onboarding_questions_asked": 0,
+        "rolling_summary": None,
         "final_response": "",
         "extracted_facts": []
     }
@@ -751,33 +715,3 @@ def run_health_agent(
         "final_response": result.get("final_response", "I'm not sure how to respond to that."),
         "extracted_facts": result.get("extracted_facts", [])
     }
-
-
-# === Legacy compatibility (if old code references app_agent) ===
-# Note: This is deprecated - use run_health_agent() instead
-class LegacyAgentWrapper:
-    """Wrapper for backwards compatibility with old code."""
-    
-    def invoke(self, inputs: dict) -> dict:
-        from db.database import SessionLocal
-        db = SessionLocal()
-        try:
-            messages = inputs.get("messages", [])
-            # Convert from old format if needed
-            formatted_messages = []
-            for m in messages:
-                if hasattr(m, 'role') and hasattr(m, 'content'):
-                    formatted_messages.append({"role": m.role, "content": m.content})
-                elif isinstance(m, dict):
-                    formatted_messages.append(m)
-            
-            result = run_health_agent(
-                db,
-                inputs.get("user_id", 1),
-                formatted_messages
-            )
-            return result
-        finally:
-            db.close()
-
-app_agent = LegacyAgentWrapper()

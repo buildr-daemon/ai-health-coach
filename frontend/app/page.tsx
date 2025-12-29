@@ -13,6 +13,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { UserChatMessage } from "@/components/chat/user-chat";
 import { AgentChatMessage } from "@/components/chat/agent-chat-message";
 import { TypingIndicator } from "@/components/chat/typing-indicator";
+import { Onboarding } from "@/components/chat/onboarding";
 import { Send, ChevronUp, MessageCircle } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -35,7 +36,7 @@ interface ChatMessage {
 
 interface ChatInitializationResponse {
   user_id: number;
-  onboarding_status: string;
+  onboarding_status: "not_started" | "in_progress" | "completed";
   recent_message_history: ChatMessage[];
   has_more_history: boolean;
   user_display_name: string | null;
@@ -160,6 +161,9 @@ function getDeviceIdentifier(): string {
 export default function ChatPage() {
   // === State ===
   const [currentUserId, setCurrentUserId] = useState<number | null>(null);
+  const [onboardingStatus, setOnboardingStatus] = useState<
+    "not_started" | "in_progress" | "completed" | null
+  >(null);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [userInputValue, setUserInputValue] = useState<string>("");
   const [isInitializing, setIsInitializing] = useState<boolean>(true);
@@ -174,7 +178,6 @@ export default function ChatPage() {
   const [oldestLoadedMessageId, setOldestLoadedMessageId] = useState<
     number | null
   >(null);
-  // Track pending retry for potential UI feedback (e.g., showing retry banner)
   const [, setPendingRetryMessage] = useState<{
     content: string;
     temporaryId: string;
@@ -202,7 +205,6 @@ export default function ChatPage() {
     const distanceFromBottom =
       viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
 
-    // Consider "near bottom" if within 100px
     return distanceFromBottom < 100;
   }, []);
 
@@ -213,7 +215,6 @@ export default function ChatPage() {
 
     setIsLoadingOlderMessages(true);
 
-    // Store current scroll height to maintain position
     if (scrollAreaViewportRef.current) {
       previousScrollHeightRef.current =
         scrollAreaViewportRef.current.scrollHeight;
@@ -232,7 +233,6 @@ export default function ChatPage() {
           ...previousMessages,
         ]);
 
-        // Update oldest message cursor
         const newOldestMessage = historyResponse.messages[0];
         if (
           newOldestMessage &&
@@ -244,7 +244,6 @@ export default function ChatPage() {
 
       setHasMoreOlderMessages(historyResponse.has_more_messages);
 
-      // Maintain scroll position after loading older messages
       requestAnimationFrame(() => {
         if (scrollAreaViewportRef.current) {
           const newScrollHeight = scrollAreaViewportRef.current.scrollHeight;
@@ -258,7 +257,12 @@ export default function ChatPage() {
     } finally {
       setIsLoadingOlderMessages(false);
     }
-  }, [currentUserId, isLoadingOlderMessages, hasMoreOlderMessages, oldestLoadedMessageId]);
+  }, [
+    currentUserId,
+    isLoadingOlderMessages,
+    hasMoreOlderMessages,
+    oldestLoadedMessageId,
+  ]);
 
   // === State for triggering load on scroll ===
   const [shouldLoadOlderOnScroll, setShouldLoadOlderOnScroll] = useState(false);
@@ -269,10 +273,8 @@ export default function ChatPage() {
 
     const viewport = scrollAreaViewportRef.current;
 
-    // Update auto-scroll flag based on scroll position
     shouldAutoScrollRef.current = checkIfNearBottomOfChat();
 
-    // Check if scrolled to top for loading older messages
     if (
       viewport.scrollTop < 50 &&
       hasMoreOlderMessages &&
@@ -307,10 +309,10 @@ export default function ChatPage() {
         const initResponse = await initializeChatSession(deviceId);
 
         setCurrentUserId(initResponse.user_id);
+        setOnboardingStatus(initResponse.onboarding_status);
         setChatMessages(initResponse.recent_message_history);
         setHasMoreOlderMessages(initResponse.has_more_history);
 
-        // Set oldest message cursor for pagination
         if (initResponse.recent_message_history.length > 0) {
           const oldestMessage = initResponse.recent_message_history[0];
           if (typeof oldestMessage.message_id === "number") {
@@ -318,7 +320,6 @@ export default function ChatPage() {
           }
         }
 
-        // Auto-scroll to latest message after initialization
         requestAnimationFrame(() => {
           scrollToLatestMessage();
         });
@@ -351,7 +352,6 @@ export default function ChatPage() {
       const temporaryMessageId =
         retryTemporaryId || generateTemporaryMessageId();
 
-      // Remove any failed message with same temp ID (for retry)
       if (retryTemporaryId) {
         setChatMessages((prev) =>
           prev.filter((msg) => msg.temporaryId !== retryTemporaryId)
@@ -359,7 +359,6 @@ export default function ChatPage() {
         setPendingRetryMessage(null);
       }
 
-      // Add optimistic user message
       const optimisticUserMessage: ChatMessage = {
         message_id: temporaryMessageId,
         role: "user",
@@ -380,7 +379,6 @@ export default function ChatPage() {
           trimmedMessageContent
         );
 
-        // Replace optimistic message with actual message and add agent response
         setChatMessages((prev) => {
           const messagesWithoutOptimistic = prev.filter(
             (msg) => msg.temporaryId !== temporaryMessageId
@@ -394,7 +392,6 @@ export default function ChatPage() {
       } catch (error) {
         console.error("Failed to send message:", error);
 
-        // Mark user message as failed
         setChatMessages((prev) =>
           prev.map((msg) =>
             msg.temporaryId === temporaryMessageId
@@ -411,7 +408,6 @@ export default function ChatPage() {
           )
         );
 
-        // Store for retry
         setPendingRetryMessage({
           content: trimmedMessageContent,
           temporaryId: temporaryMessageId,
@@ -443,13 +439,17 @@ export default function ChatPage() {
   // === Retry agent response ===
   const handleRetryAgentResponse = useCallback(
     (userMessageContent: string) => {
-      // This would re-trigger the agent for the last user message
       if (currentUserId) {
         handleSendMessage(userMessageContent);
       }
     },
     [currentUserId, handleSendMessage]
   );
+
+  // === Handle onboarding completion ===
+  const handleOnboardingComplete = useCallback(() => {
+    setOnboardingStatus("completed");
+  }, []);
 
   // === Render loading state ===
   if (isInitializing) {
@@ -478,6 +478,21 @@ export default function ChatPage() {
     );
   }
 
+  // === Render onboarding for new users ===
+  if (
+    currentUserId &&
+    onboardingStatus &&
+    onboardingStatus !== "completed"
+  ) {
+    return (
+      <Onboarding
+        userId={currentUserId}
+        onOnboardingComplete={handleOnboardingComplete}
+        apiBaseUrl={API_BASE_URL}
+      />
+    );
+  }
+
   // === Main chat render ===
   return (
     <div className="flex flex-col h-screen bg-whatsapp-dark-bg">
@@ -500,112 +515,108 @@ export default function ChatPage() {
         className="flex-1 overflow-y-auto whatsapp-chat-pattern chat-scrollbar"
         onScroll={handleChatScroll}
       >
-          <div className="flex flex-col py-4 min-h-full">
-            {/* Load More Button / Indicator */}
-            {hasMoreOlderMessages && (
-              <div className="flex justify-center py-2">
-                {isLoadingOlderMessages ? (
-                  <div className="flex items-center gap-2 text-gray-400">
-                    <Spinner className="size-4" />
-                    <span className="text-sm">Loading older messages...</span>
-                  </div>
-                ) : (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={loadOlderMessages}
-                    className="text-gray-400 hover:text-white hover:bg-whatsapp-header-bg"
-                  >
-                    <ChevronUp className="size-4 mr-1" />
-                    Load older messages
-                  </Button>
-                )}
-              </div>
-            )}
-
-            {/* Empty state */}
-            {chatMessages.length === 0 && !isAgentProcessing && (
-              <div className="flex-1 flex flex-col items-center justify-center text-center px-8">
-                <div className="size-20 rounded-full bg-whatsapp-header-bg flex items-center justify-center mb-4">
-                  <MessageCircle className="size-10 text-whatsapp-teal" />
+        <div className="flex flex-col py-4 min-h-full">
+          {/* Load More Button / Indicator */}
+          {hasMoreOlderMessages && (
+            <div className="flex justify-center py-2">
+              {isLoadingOlderMessages ? (
+                <div className="flex items-center gap-2 text-gray-400">
+                  <Spinner className="size-4" />
+                  <span className="text-sm">Loading older messages...</span>
                 </div>
-                <h2 className="text-white text-xl font-semibold mb-2">
-                  Welcome to Health Agent
-                </h2>
-                <p className="text-gray-400 max-w-md">
-                  Start a conversation to get personalized health guidance. Your
-                  chat history will be saved for future reference.
-                </p>
+              ) : (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={loadOlderMessages}
+                  className="text-gray-400 hover:text-white hover:bg-whatsapp-header-bg"
+                >
+                  <ChevronUp className="size-4 mr-1" />
+                  Load older messages
+                </Button>
+              )}
+            </div>
+          )}
+
+          {/* Empty state */}
+          {chatMessages.length === 0 && !isAgentProcessing && (
+            <div className="flex-1 flex flex-col items-center justify-center text-center px-8">
+              <div className="size-20 rounded-full bg-whatsapp-header-bg flex items-center justify-center mb-4">
+                <MessageCircle className="size-10 text-whatsapp-teal" />
               </div>
-            )}
+              <h2 className="text-white text-xl font-semibold mb-2">
+                Welcome to Health Agent
+              </h2>
+              <p className="text-gray-400 max-w-md">
+                Start a conversation to get personalized health guidance. Your
+                chat history will be saved for future reference.
+              </p>
+            </div>
+          )}
 
-            {/* Message List */}
-            {chatMessages.map((message, index) => {
-              const isUserMessage = message.role === "user";
-              const messageKey = message.temporaryId || message.message_id;
+          {/* Message List */}
+          {chatMessages.map((message, index) => {
+            const isUserMessage = message.role === "user";
+            const messageKey = message.temporaryId || message.message_id;
 
-              if (isUserMessage) {
-                return (
-                  <UserChatMessage
-                    key={messageKey}
-                    messageId={message.message_id}
-                    messageContent={message.content}
-                    createdAt={new Date(message.created_at)}
-                    isSending={message.isPending}
-                    hasSendFailed={message.hasFailed}
-                    sendErrorMessage={message.errorMessage}
-                    onRetryMessageSend={
-                      message.hasFailed && message.temporaryId
-                        ? () =>
-                            handleRetryUserMessage(
-                              message.temporaryId!,
-                              message.content
-                            )
-                        : undefined
-                    }
-                  />
-                );
-              }
-
+            if (isUserMessage) {
               return (
-                <AgentChatMessage
+                <UserChatMessage
                   key={messageKey}
                   messageId={message.message_id}
                   messageContent={message.content}
                   createdAt={new Date(message.created_at)}
-                  hasResponseFailed={message.hasFailed}
-                  responseErrorMessage={message.errorMessage}
-                  onRetryAgentResponse={
-                    message.hasFailed
-                      ? () => {
-                          // Find the user message before this agent message to retry
-                          const previousUserMessage = chatMessages
-                            .slice(0, index)
-                            .reverse()
-                            .find((m) => m.role === "user");
-                          if (previousUserMessage) {
-                            handleRetryAgentResponse(previousUserMessage.content);
-                          }
-                        }
+                  isSending={message.isPending}
+                  hasSendFailed={message.hasFailed}
+                  sendErrorMessage={message.errorMessage}
+                  onRetryMessageSend={
+                    message.hasFailed && message.temporaryId
+                      ? () =>
+                          handleRetryUserMessage(
+                            message.temporaryId!,
+                            message.content
+                          )
                       : undefined
                   }
                 />
               );
-            })}
+            }
 
-            {/* Typing Indicator */}
-            {isAgentProcessing && (
-              <TypingIndicator isVisible={true} displayText="typing" />
-            )}
-          </div>
+            return (
+              <AgentChatMessage
+                key={messageKey}
+                messageId={message.message_id}
+                messageContent={message.content}
+                createdAt={new Date(message.created_at)}
+                hasResponseFailed={message.hasFailed}
+                responseErrorMessage={message.errorMessage}
+                onRetryAgentResponse={
+                  message.hasFailed
+                    ? () => {
+                        const previousUserMessage = chatMessages
+                          .slice(0, index)
+                          .reverse()
+                          .find((m) => m.role === "user");
+                        if (previousUserMessage) {
+                          handleRetryAgentResponse(previousUserMessage.content);
+                        }
+                      }
+                    : undefined
+                }
+              />
+            );
+          })}
+
+          {/* Typing Indicator */}
+          {isAgentProcessing && (
+            <TypingIndicator isVisible={true} displayText="typing" />
+          )}
+        </div>
       </div>
 
       {/* Message Input Area */}
       <div className="px-4 py-3 bg-whatsapp-header-bg border-t border-whatsapp-border">
-        <form
-          onSubmit={handleFormSubmit}
-          className="flex items-center gap-3"
-        >
+        <form onSubmit={handleFormSubmit} className="flex items-center gap-3">
           <Input
             ref={messageInputRef}
             type="text"

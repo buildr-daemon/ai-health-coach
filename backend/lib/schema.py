@@ -3,7 +3,7 @@ Pydantic schemas for API request/response validation.
 All models use verbose, descriptive field names for clarity.
 """
 from pydantic import BaseModel, Field, field_validator
-from typing import Optional, List
+from typing import Optional, List, Literal
 from datetime import datetime
 from enum import Enum
 
@@ -93,6 +93,50 @@ class ChatInitializationResponse(BaseModel):
     )
 
 
+# === Onboarding ===
+
+class OnboardingSubmissionRequest(BaseModel):
+    """
+    Request to submit user profile during onboarding.
+    Collects essential user information for personalized health guidance.
+    """
+    user_id: int = Field(..., description="ID of the user to onboard", gt=0)
+    display_name: str = Field(
+        ..., 
+        description="User's preferred name",
+        min_length=1,
+        max_length=100
+    )
+    age_years: int = Field(
+        ..., 
+        description="User's age in years",
+        ge=1,
+        le=120
+    )
+    biological_sex: Literal["male", "female", "other"] = Field(
+        ..., 
+        description="Biological sex for medical context"
+    )
+    
+    @field_validator('display_name')
+    @classmethod
+    def validate_display_name(cls, value: str) -> str:
+        """Ensure name is not just whitespace."""
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("Display name cannot be empty")
+        return stripped
+
+
+class OnboardingSubmissionResponse(BaseModel):
+    """
+    Response after completing onboarding.
+    """
+    success: bool = Field(..., description="Whether onboarding was successful")
+    user_id: int = Field(..., description="The user's ID")
+    message: str = Field(..., description="Success or error message")
+
+
 # === Message Sending ===
 
 class SendMessageRequest(BaseModel):
@@ -105,7 +149,7 @@ class SendMessageRequest(BaseModel):
         ..., 
         description="The message text to send",
         min_length=1,
-        max_length=4000  # Prevent extremely long messages
+        max_length=4000
     )
     
     @field_validator('message_content')
@@ -153,7 +197,7 @@ class ChatHistoryPaginationRequest(BaseModel):
         default=20,
         description="Number of messages to fetch",
         ge=1,
-        le=50  # Cap to prevent huge responses
+        le=50
     )
 
 
@@ -212,7 +256,7 @@ class UserMemoryFact(BaseModel):
     fact_id: int
     fact_content: str
     extracted_at: datetime
-    category: Optional[str] = None  # e.g., "symptom", "lifestyle", "medical_history"
+    category: Optional[str] = None
 
 
 class AgentContextBundle(BaseModel):
@@ -222,12 +266,12 @@ class AgentContextBundle(BaseModel):
     """
     user_id: int
     user_display_name: Optional[str]
-    user_health_profile_summary: Optional[str]
+    user_age: Optional[int]
+    user_biological_sex: Optional[str]
     conversation_messages: List[ChatMessageForAgent]
-    conversation_summary: Optional[str]  # For overflow handling
+    rolling_summary: Optional[str]
     retrieved_protocols: List[RetrievedProtocol]
     user_memory_facts: List[UserMemoryFact]
-    is_onboarding_conversation: bool
 
 
 # === Health Data Extraction ===
