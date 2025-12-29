@@ -34,7 +34,6 @@ SUMMARIZE_EVERY_N_MESSAGES = 4  # Summarize every 4 new messages
 class AgentState(TypedDict):
     """
     Simplified state for the health agent graph.
-    Uses rolling summary + last 4 messages approach.
     """
     # User identification
     user_id: int

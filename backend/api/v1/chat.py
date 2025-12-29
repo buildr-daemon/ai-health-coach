@@ -54,9 +54,6 @@ INITIAL_HISTORY_LIMIT = 20  # Messages to load on init
 MAX_MESSAGE_LENGTH = 4000  # Character limit for messages
 MAX_CONTEXT_MESSAGES = 4  # Last 4 messages for agent context
 
-
-# === Error Helpers ===
-
 def raise_user_not_found(user_id: int):
     """Raise standardized user not found error."""
     raise HTTPException(
