@@ -11,7 +11,7 @@ ollama run llama3.2
 # run backend
 cd backend
 uv sync
-uv add main.py
+uv run main.py
 
 # run frontend
 cd frontend
